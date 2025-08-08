@@ -1,0 +1,313 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>3D Fighting Anime Prototype</title>
+  <style>
+    body { margin:0; overflow:hidden; font-family: sans-serif; background:#111; color:#eee; }
+    #overlay {
+      position: absolute; left: 10px; top: 10px; z-index: 10;
+      background: rgba(0,0,0,0.4); padding:10px; border-radius:6px;
+    }
+    .hp { width:200px; height:14px; background:#222; border:1px solid #444; margin:6px 0; border-radius:4px; overflow:hidden;}
+    .hp > .fill { height:100%; width:100%; background: linear-gradient(90deg,#ff6b6b,#ff3b3b); }
+    #instructions { font-size:13px; color:#ddd; margin-top:8px; max-width:360px; }
+  </style>
+</head>
+<body>
+  <div id="overlay">
+    <div>Player 1 (Left) HP</div>
+    <div class="hp"><div id="hp1" class="fill"></div></div>
+    <div>Player 2 (Right) HP</div>
+    <div class="hp"><div id="hp2" class="fill"></div></div>
+    <div id="instructions">
+      <strong>Controls</strong><br>
+      Player1: W/A/S/D move, F = Punch, G = Kick<br>
+      Player2: Arrow keys move, K = Punch, L = Kick<br>
+      Replace model URLs inside the script to use real characters. Serve files from a web server when using local models.
+    </div>
+  </div>
+
+  <script type="module">
+    import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.158.0/build/three.module.js';
+    import { OrbitControls } from 'https://cdn.jsdelivr.net/npm/three@0.158.0/examples/jsm/controls/OrbitControls.js';
+    import { GLTFLoader } from 'https://cdn.jsdelivr.net/npm/three@0.158.0/examples/jsm/loaders/GLTFLoader.js';
+    import { DRACOLoader } from 'https://cdn.jsdelivr.net/npm/three@0.158.0/examples/jsm/loaders/DRACOLoader.js';
+
+    let scene, camera, renderer, clock;
+    let mixers = [], activeActions = [];
+    const players = [];
+
+    // Replace these with your model URLs (public / served locally)
+    const modelUrl1 = null; // e.g. 'models/hero1.glb'
+    const modelUrl2 = null; // e.g. 'models/hero2.glb'
+
+    init();
+    animate();
+
+    function init(){
+      scene = new THREE.Scene();
+      scene.background = new THREE.Color(0x101020);
+
+      camera = new THREE.PerspectiveCamera(50, innerWidth/innerHeight, 0.1, 2000);
+      camera.position.set(0, 6, 12);
+
+      renderer = new THREE.WebGLRenderer({antialias:true});
+      renderer.setSize(innerWidth, innerHeight);
+      document.body.appendChild(renderer.domElement);
+
+      const ambient = new THREE.AmbientLight(0xffffff, 0.6);
+      scene.add(ambient);
+      const dir = new THREE.DirectionalLight(0xffffff, 0.9);
+      dir.position.set(5,10,7);
+      scene.add(dir);
+
+      // Floor
+      const floor = new THREE.Mesh(
+        new THREE.PlaneGeometry(50,50),
+        new THREE.MeshStandardMaterial({color:0x222244, metalness:0.1, roughness:0.9})
+      );
+      floor.rotation.x = -Math.PI/2;
+      floor.position.y = 0;
+      scene.add(floor);
+
+      clock = new THREE.Clock();
+
+      // Controls for camera (optional)
+      const controls = new OrbitControls(camera, renderer.domElement);
+      controls.target.set(0,2,0);
+      controls.update();
+
+      // Create players (either glTF or fallback boxes)
+      createPlayer({ x: -3, name:'p1', color:0x66ccff, modelUrl: modelUrl1, controlSet: 'p1' });
+      createPlayer({ x:  3, name:'p2', color:0xff6b6b, modelUrl: modelUrl2, controlSet: 'p2' });
+
+      window.addEventListener('resize', ()=> {
+        camera.aspect = innerWidth/innerHeight;
+        camera.updateProjectionMatrix();
+        renderer.setSize(innerWidth, innerHeight);
+      });
+    }
+
+    function createPlayer({x=0, name='p', color=0x7777ff, modelUrl=null, controlSet='p1'}) {
+      const player = {
+        name,
+        group: new THREE.Group(),
+        mixer: null,
+        actions: {},
+        currentAction: null,
+        box: null,
+        worldBox: new THREE.Box3(),
+        health: 100,
+        isAttacking: false,
+        position: new THREE.Vector3(x,0,0),
+        velocity: new THREE.Vector3(),
+        controlSet
+      };
+      player.group.position.set(x,0,0);
+      scene.add(player.group);
+
+      if(modelUrl){
+        // GLTF loader with DRACO support
+        const draco = new DRACOLoader();
+        draco.setDecoderPath('https://www.gstatic.com/draco/v1/decoders/');
+        const loader = new GLTFLoader();
+        loader.setDRACOLoader(draco);
+        loader.load(modelUrl, (gltf) => {
+          const model = gltf.scene;
+          model.traverse(c => { if(c.isMesh) c.castShadow=true; });
+          // scale and center heuristic:
+          const box = new THREE.Box3().setFromObject(model);
+          const size = new THREE.Vector3();
+          box.getSize(size);
+          const scale = 2 / Math.max(size.y, size.x, size.z);
+          model.scale.setScalar(scale);
+          model.position.y = -box.min.y * scale; // sit on ground
+          player.group.add(model);
+
+          // animations
+          player.mixer = new THREE.AnimationMixer(model);
+          mixers.push(player.mixer);
+          if(gltf.animations && gltf.animations.length){
+            // find commonly named animations
+            const anims = {};
+            gltf.animations.forEach(a => anims[a.name.toLowerCase()] = a);
+            // example names: Idle, idle, Punch, Attack, Kick, Run, Walk
+            player.actions.idle = player.mixer.clipAction(anims['idle'] || gltf.animations[0]);
+            player.actions.punch = player.mixer.clipAction(anims['punch'] || gltf.animations.find(a=>/punch|attack/i.test(a.name)) || gltf.animations[0]);
+            player.actions.kick  = player.mixer.clipAction(anims['kick']  || gltf.animations.find(a=>/kick/i.test(a.name)) || gltf.animations[0]);
+            // ensure loop
+            for(const k in player.actions) player.actions[k].setLoop(THREE.LoopOnce);
+            player.actions.idle.play();
+            player.currentAction = player.actions.idle;
+          }
+        }, undefined, e=> {
+          console.error('Model load error', e);
+          createFallback();
+        });
+      } else {
+        createFallback();
+      }
+
+      function createFallback(){
+        // simple anime-ish box + head
+        const body = new THREE.Mesh(new THREE.BoxGeometry(1.2,2.2,0.8), new THREE.MeshStandardMaterial({color}));
+        body.position.y = 1.1;
+        const head = new THREE.Mesh(new THREE.BoxGeometry(0.9,0.9,0.9), new THREE.MeshStandardMaterial({color: 0xffffff}));
+        head.position.y = 2.6;
+        player.group.add(body);
+        player.group.add(head);
+        // simple mock "animations" by rotating head and punching using tween-like flags
+        player.mixer = null;
+        player.actions.idle = { name:'idle' };
+        player.actions.punch = { name:'punch' };
+        player.actions.kick  = { name:'kick' };
+        player.currentAction = player.actions.idle;
+      }
+
+      // bounding box for collisions (updated each frame)
+      player.box = new THREE.Box3().setFromCenterAndSize(new THREE.Vector3(), new THREE.Vector3(1.2,2.4,1));
+      player.group.position.copy(player.position);
+      players.push(player);
+      return player;
+    }
+
+    // Controls
+    const keys = {};
+    window.addEventListener('keydown', e => keys[e.code] = true);
+    window.addEventListener('keyup', e => keys[e.code] = false);
+
+    function handleControls(player, dt){
+      const speed = 4;
+      const pos = player.group.position;
+      if(player.controlSet === 'p1'){
+        if(keys['KeyW']) pos.z -= speed*dt;
+        if(keys['KeyS']) pos.z += speed*dt;
+        if(keys['KeyA']) pos.x -= speed*dt;
+        if(keys['KeyD']) pos.x += speed*dt;
+        if(keys['KeyF'] && !player.isAttacking) startAttack(player, 'punch');
+        if(keys['KeyG'] && !player.isAttacking) startAttack(player, 'kick');
+      } else {
+        if(keys['ArrowUp']) pos.z -= speed*dt;
+        if(keys['ArrowDown']) pos.z += speed*dt;
+        if(keys['ArrowLeft']) pos.x -= speed*dt;
+        if(keys['ArrowRight']) pos.x += speed*dt;
+        if(keys['KeyK'] && !player.isAttacking) startAttack(player, 'punch');
+        if(keys['KeyL'] && !player.isAttacking) startAttack(player, 'kick');
+      }
+      // keep inside bounds
+      pos.x = THREE.MathUtils.clamp(pos.x, -10, 10);
+      pos.z = THREE.MathUtils.clamp(pos.z, -10, 10);
+    }
+
+    function startAttack(player, type='punch'){
+      player.isAttacking = true;
+      // If using real animations
+      if(player.mixer && player.actions[type]){
+        const act = player.actions[type];
+        const prev = player.currentAction;
+        if(prev && prev.fadeOut) prev.fadeOut(0.1);
+        act.reset();
+        act.fadeIn(0.1);
+        act.play();
+        player.currentAction = act;
+        // when animation ends -> set isAttacking false and switch to idle
+        const duration = act.getClip().duration;
+        setTimeout(()=> {
+          player.isAttacking = false;
+          if(player.actions.idle){
+            player.actions.idle.reset();
+            player.actions.idle.fadeIn(0.15);
+            player.actions.idle.play();
+            player.currentAction = player.actions.idle;
+          }
+        }, duration*1000);
+      } else {
+        // fallback: quick timeout
+        setTimeout(()=> player.isAttacking = false, 350);
+      }
+      // register hit attempt slightly after attack starts
+      setTimeout(()=> tryHit(player, type), 130);
+    }
+
+    function tryHit(attacker, type){
+      // find defender (the other player)
+      const defender = players.find(p => p !== attacker);
+      if(!defender) return;
+      // update bounding boxes
+      updatePlayerBox(attacker);
+      updatePlayerBox(defender);
+
+      // create an attack box in front of attacker
+      const dir = (defender.group.position.x < attacker.group.position.x) ? -1 : 1;
+      const attackCenter = attacker.group.position.clone();
+      attackCenter.x += dir * 1.2; // reach
+      attackCenter.y += 1.0;
+      const attackBox = new THREE.Box3().setFromCenterAndSize(attackCenter, new THREE.Vector3(1.2,1.2,1.2));
+
+      if(attackBox.intersectsBox(defender.worldBox)){
+        // hit!
+        const damage = (type==='kick') ? 12 : 8;
+        defender.health = Math.max(0, defender.health - damage);
+        updateHPUI();
+        // push defender slightly
+        const push = new THREE.Vector3(dir * 0.6, 0, 0);
+        defender.group.position.add(push);
+        // check knock out
+        if(defender.health <= 0){
+          // simple KO behavior
+          console.log(defender.name + ' KO!');
+        }
+      }
+    }
+
+    function updatePlayerBox(player){
+      // compute bounding box around player.group in world coords
+      const box = new THREE.Box3().setFromObject(player.group);
+      player.worldBox.copy(box);
+    }
+
+    function updateHPUI(){
+      const hp1 = document.getElementById('hp1');
+      const hp2 = document.getElementById('hp2');
+      hp1.style.width = players[0].health + '%';
+      hp2.style.width = players[1].health + '%';
+    }
+
+    function animate(){
+      requestAnimationFrame(animate);
+      const dt = Math.min(0.05, clock.getDelta());
+
+      // handle controls
+      players.forEach(p => handleControls(p, dt));
+
+      // update mixers
+      mixers.forEach(m => m.update(dt));
+
+      // fallback procedural "animations" for non-gltf players
+      players.forEach(p => {
+        if(!p.mixer){
+          // head bob when idle
+          const head = p.group.children.find(c=>c.geometry && c.geometry.type === 'BoxGeometry' && c.position.y > 2.0);
+          if(head) head.rotation.y = Math.sin(performance.now()/400 + p.group.position.x)*0.15;
+          // "attack" visual
+          if(p.isAttacking){
+            p.group.rotation.y = Math.sin(performance.now()/80) * 0.12;
+          } else {
+            p.group.rotation.y *= 0.9;
+          }
+        }
+        updatePlayerBox(p);
+      });
+
+      // simple camera follow: look at center of players
+      const center = new THREE.Vector3();
+      players.forEach(p => center.add(p.group.position));
+      center.multiplyScalar(1/players.length);
+      camera.lookAt(center.x, 2, center.z);
+
+      renderer.render(scene, camera);
+    }
+  </script>
+</body>
+</html>
